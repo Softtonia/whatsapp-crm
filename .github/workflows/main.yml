@@ -1,0 +1,488 @@
+
+name: Deploy WhatsApp CRM Dev
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: whatsapp-crm-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy WhatsApp CRM to VPS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      DEPLOY_HOST: ${{ secrets.DEV_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEV_PORT }}
+      DEPLOY_USER: ${{ secrets.DEV_USER }}
+      DEPLOY_BASE_PATH: ${{ secrets.DEV_BASE_PATH }}
+      PHP_BIN: /usr/bin/php8.3
+
+    steps:
+      # --------------------------------------------------
+      # 1. CHECKOUT
+      # --------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 2. VALIDATE SECRETS AND PROJECT
+      # --------------------------------------------------
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for name in DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_BASE_PATH; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name secret is missing."
+              exit 1
+            fi
+          done
+
+          if [ "$DEPLOY_PORT" != "22" ]; then
+            echo "::error::Unexpected SSH port."
+            exit 1
+          fi
+
+          if [ "$DEPLOY_USER" != "root" ]; then
+            echo "::error::This workflow is configured for root."
+            exit 1
+          fi
+
+          if [ "$DEPLOY_BASE_PATH" != "/var/www/whatsappcrmapi.softtonia.com" ]; then
+            echo "::error::Unexpected deployment path."
+            exit 1
+          fi
+
+          for file in artisan composer.json composer.lock public/index.php; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Required project file missing: $file"
+              exit 1
+            fi
+          done
+
+          echo "Configuration and Laravel project checks passed."
+
+      # --------------------------------------------------
+      # 3. SET UP SSH
+      # --------------------------------------------------
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEV_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEV_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          test -n "$SSH_PRIVATE_KEY" || {
+            echo "::error::DEV_SSH_KEY is missing."
+            exit 1
+          }
+
+          test -n "$SSH_KNOWN_HOSTS" || {
+            echo "::error::DEV_SSH_KNOWN_HOSTS is missing."
+            exit 1
+          }
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" \
+            | tr -d '\r' > "$HOME/.ssh/whatsappcrm_key"
+
+          chmod 600 "$HOME/.ssh/whatsappcrm_key"
+
+          ssh-keygen -y -f "$HOME/.ssh/whatsappcrm_key" >/dev/null
+
+          printf '%s\n' "$SSH_KNOWN_HOSTS" \
+            > "$HOME/.ssh/known_hosts"
+
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          cat > "$HOME/.ssh/config" <<EOF
+          Host whatsappcrm-vps
+              HostName ${DEPLOY_HOST}
+              Port ${DEPLOY_PORT}
+              User ${DEPLOY_USER}
+              IdentityFile ${HOME}/.ssh/whatsappcrm_key
+              IdentitiesOnly yes
+              BatchMode yes
+              PasswordAuthentication no
+              KbdInteractiveAuthentication no
+              StrictHostKeyChecking yes
+              UserKnownHostsFile ${HOME}/.ssh/known_hosts
+              ConnectTimeout 15
+              ServerAliveInterval 15
+              ServerAliveCountMax 3
+          EOF
+
+          chmod 600 "$HOME/.ssh/config"
+
+          ssh whatsappcrm-vps "printf 'SSH connection successful\n'"
+
+      # --------------------------------------------------
+      # 4. PREPARE CRM DIRECTORIES
+      # --------------------------------------------------
+      - name: Prepare server directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh whatsappcrm-vps \
+            "BASE='$DEPLOY_BASE_PATH' PHP_BIN='$PHP_BIN' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          BASE="$BASE"
+
+          # Do not follow or replace an unexpected current symlink.
+          if [ -L "$BASE/current" ]; then
+            echo "ERROR: current is a symlink; inspect before deployment."
+            exit 1
+          fi
+
+          mkdir -p \
+            "$BASE/current" \
+            "$BASE/releases" \
+            "$BASE/shared/backups" \
+            "$BASE/shared/storage/app/private" \
+            "$BASE/shared/storage/app/public" \
+            "$BASE/shared/storage/framework/cache/data" \
+            "$BASE/shared/storage/framework/sessions" \
+            "$BASE/shared/storage/framework/testing" \
+            "$BASE/shared/storage/framework/views" \
+            "$BASE/shared/storage/logs"
+
+          test -f "$BASE/shared/.env" || {
+            echo "ERROR: shared/.env is missing."
+            exit 1
+          }
+
+          chmod 600 "$BASE/shared/.env"
+          chmod 700 "$BASE/shared/backups"
+
+          echo "Directory preparation passed."
+          REMOTE
+
+      # --------------------------------------------------
+      # 5. UPLOAD TO CURRENT
+      # --------------------------------------------------
+      - name: Upload application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rsync -az \
+            --no-owner \
+            --no-group \
+            --exclude='/.git/' \
+            --exclude='/.github/' \
+            --exclude='/.env' \
+            --exclude='/.env.*' \
+            --exclude='/vendor/' \
+            --exclude='/node_modules/' \
+            --exclude='/storage/' \
+            --exclude='/public/storage' \
+            --exclude='/bootstrap/cache/*.php' \
+            --exclude='/tests/' \
+            --exclude='/docs/' \
+            --exclude='/phpunit.xml' \
+            --exclude='/.phpunit.cache/' \
+            --exclude='/README.md' \
+            -e "ssh -F $HOME/.ssh/config" \
+            ./ \
+            "whatsappcrm-vps:${DEPLOY_BASE_PATH}/current/"
+
+      # --------------------------------------------------
+      # 6. INSTALL AND VALIDATE LARAVEL
+      # --------------------------------------------------
+      - name: Install application dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh whatsappcrm-vps \
+            "BASE='$DEPLOY_BASE_PATH' PHP_BIN='$PHP_BIN' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          BASE="$BASE"
+          APP="$BASE/current"
+          SHARED="$BASE/shared"
+
+          command -v "$PHP_BIN" >/dev/null || {
+            echo "ERROR: PHP binary not found on VPS: $PHP_BIN"
+            exit 1
+          }
+
+          test -f "$APP/artisan"
+          test -f "$APP/composer.lock"
+          test -f "$APP/public/index.php"
+
+          # Fail rather than overwrite an existing non-symlink .env.
+          if [ -e "$APP/.env" ] && [ ! -L "$APP/.env" ]; then
+            echo "ERROR: current/.env exists as a regular file."
+            exit 1
+          fi
+
+          if [ -L "$APP/.env" ]; then
+            test "$(readlink -f "$APP/.env")" = "$(readlink -f "$SHARED/.env")" || {
+              echo "ERROR: Unexpected .env symlink."
+              exit 1
+            }
+          else
+            ln -s "$SHARED/.env" "$APP/.env"
+          fi
+
+          # Fail safely if storage already contains app data.
+          if [ -e "$APP/storage" ] && [ ! -L "$APP/storage" ]; then
+            if [ -n "$(find "$APP/storage" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              echo "ERROR: current/storage is not empty; migrate it safely first."
+              exit 1
+            fi
+            rmdir "$APP/storage"
+          fi
+
+          if [ ! -L "$APP/storage" ]; then
+            ln -s "$SHARED/storage" "$APP/storage"
+          else
+            test "$(readlink -f "$APP/storage")" = "$(readlink -f "$SHARED/storage")" || {
+              echo "ERROR: Unexpected storage symlink."
+              exit 1
+            }
+          fi
+
+          mkdir -p "$APP/bootstrap/cache"
+          chmod 2775 "$APP/bootstrap/cache"
+
+          cd "$APP"
+
+          # Validate required production configuration without printing secrets.
+          "$PHP_BIN" -r '
+          $env = parse_ini_file(".env", false, INI_SCANNER_RAW);
+          if (!$env) { fwrite(STDERR, "Cannot parse .env\n"); exit(1); }
+
+          $required = [
+            "APP_KEY", "APP_URL", "DB_DATABASE",
+            "DB_USERNAME", "DB_PASSWORD"
+          ];
+
+          foreach ($required as $key) {
+            if (!isset($env[$key]) || trim((string)$env[$key]) === "") {
+              fwrite(STDERR, "Missing required .env value: $key\n");
+              exit(1);
+            }
+          }
+
+          if (str_contains((string)$env["APP_KEY"], "REPLACE_WITH")) {
+            fwrite(STDERR, "APP_KEY is not configured\n");
+            exit(1);
+          }
+
+          foreach (["DB_PASSWORD", "MAIL_PASSWORD", "RAZORPAY_KEY_SECRET"] as $key) {
+            if (isset($env[$key]) && str_contains((string)$env[$key], "REPLACE_WITH")) {
+              fwrite(STDERR, "Unconfigured secret: $key\n");
+              exit(1);
+            }
+          }
+
+          if (trim((string)($env["APP_ENV"] ?? "")) !== "production" ||
+              strtolower(trim((string)($env["APP_DEBUG"] ?? ""))) !== "false" ||
+              trim((string)($env["APP_URL"] ?? "")) !== "https://whatsappcrmapi.softtonia.com" ||
+              trim((string)($env["DB_DATABASE"] ?? "")) !== "whatsappcrm") {
+            fwrite(STDERR, "Production environment safety check failed\n");
+            exit(1);
+          }
+          '
+
+          COMPOSER_CACHE_DIR=/root/.cache/composer \
+            composer install \
+              --no-dev \
+              --no-interaction \
+              --prefer-dist \
+              --optimize-autoloader \
+              --no-progress
+
+          test -f vendor/autoload.php
+
+          # Verify that Laravel can load the environment and config.
+          "$PHP_BIN" artisan --version
+
+          echo "Dependency installation passed."
+          REMOTE
+
+      # --------------------------------------------------
+      # 7. DATABASE BACKUP
+      # --------------------------------------------------
+      - name: Back up database before migrations
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh whatsappcrm-vps \
+            "BASE='$DEPLOY_BASE_PATH' PHP_BIN='$PHP_BIN' GITHUB_SHA='$GITHUB_SHA' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          BASE="$BASE"
+          APP="$BASE/current"
+          BACKUPS="$BASE/shared/backups"
+
+          cd "$APP"
+          export APP_BASE_PATH="$APP"
+
+          # Load database settings through Laravel config, not shell-sourcing .env.
+          DB_JSON="$("$PHP_BIN" -r '
+          require getenv("APP_BASE_PATH")."/vendor/autoload.php";
+          $app = require getenv("APP_BASE_PATH")."/bootstrap/app.php";
+          $app->make(\Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+          echo json_encode([
+            "host" => config("database.connections.mysql.host"),
+            "port" => config("database.connections.mysql.port"),
+            "database" => config("database.connections.mysql.database"),
+            "username" => config("database.connections.mysql.username"),
+            "password" => config("database.connections.mysql.password")
+          ], JSON_THROW_ON_ERROR);
+          ')"
+
+          DB_HOST="$(printf '%s' "$DB_JSON" | "$PHP_BIN" -r '$d=json_decode(stream_get_contents(STDIN),true); echo $d["host"] ?? "";')"
+          DB_PORT="$(printf '%s' "$DB_JSON" | "$PHP_BIN" -r '$d=json_decode(stream_get_contents(STDIN),true); echo $d["port"] ?? "3306";')"
+          DB_NAME="$(printf '%s' "$DB_JSON" | "$PHP_BIN" -r '$d=json_decode(stream_get_contents(STDIN),true); echo $d["database"] ?? "";')"
+          DB_USER="$(printf '%s' "$DB_JSON" | "$PHP_BIN" -r '$d=json_decode(stream_get_contents(STDIN),true); echo $d["username"] ?? "";')"
+          DB_PASS="$(printf '%s' "$DB_JSON" | "$PHP_BIN" -r '$d=json_decode(stream_get_contents(STDIN),true); echo $d["password"] ?? "";')"
+          unset DB_JSON
+
+          if [ "$DB_NAME" != "whatsappcrm" ]; then
+            unset DB_PASS
+            echo "ERROR: Unexpected database target."
+            exit 1
+          fi
+
+          test -n "$DB_HOST"
+          test -n "$DB_USER"
+          test -n "$DB_PASS"
+
+          command -v mysqldump >/dev/null
+          command -v gzip >/dev/null
+
+          DEPLOY_ID="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA:-manual}"
+          DEPLOY_ID="${DEPLOY_ID:0:40}"
+
+          BACKUP="$BACKUPS/db-before-${DEPLOY_ID}.sql.gz"
+          TMP="${BACKUP}.tmp"
+
+          umask 077
+          trap 'rm -f "$TMP"; unset DB_PASS' EXIT
+
+          MYSQL_PWD="$DB_PASS" mysqldump \
+            --host="$DB_HOST" \
+            --port="$DB_PORT" \
+            --user="$DB_USER" \
+            --single-transaction \
+            --quick \
+            --lock-tables=false \
+            --no-tablespaces \
+            "$DB_NAME" | gzip > "$TMP"
+
+          unset DB_PASS
+
+          test -s "$TMP"
+          gzip -t "$TMP"
+          mv "$TMP" "$BACKUP"
+          chmod 600 "$BACKUP"
+
+          echo "Database backup created successfully."
+
+          # Keep the latest 5 backups for this CRM only.
+          find "$BACKUPS" -maxdepth 1 -type f \
+            -name 'db-before-*.sql.gz' -printf '%T@ %p\n' \
+            | sort -nr | tail -n +6 | cut -d' ' -f2- \
+            | xargs -r rm -f
+
+          REMOTE
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+
+      # --------------------------------------------------
+      # 8. MIGRATE AND CACHE
+      # --------------------------------------------------
+      - name: Run Laravel migrations and caches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh whatsappcrm-vps \
+            "BASE='$DEPLOY_BASE_PATH' PHP_BIN='$PHP_BIN' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          APP="$BASE/current"
+          cd "$APP"
+
+          "$PHP_BIN" artisan optimize:clear
+          "$PHP_BIN" artisan migrate --force
+          "$PHP_BIN" artisan config:cache
+          "$PHP_BIN" artisan route:cache
+          "$PHP_BIN" artisan view:cache
+
+          # Create public storage symlink only if safe.
+          if [ -e public/storage ] && [ ! -L public/storage ]; then
+            echo "ERROR: public/storage exists as a real file/directory."
+            exit 1
+          fi
+
+          if [ ! -L public/storage ]; then
+            ln -s "$BASE/shared/storage/app/public" public/storage
+          else
+            test "$(readlink -f public/storage)" = \
+              "$(readlink -f "$BASE/shared/storage/app/public")" || {
+                echo "ERROR: Unexpected public/storage symlink."
+                exit 1
+              }
+          fi
+
+          "$PHP_BIN" artisan queue:restart || true
+
+          echo "Migrations and Laravel caches completed."
+          REMOTE
+
+      # --------------------------------------------------
+      # 9. DEPLOYMENT SUMMARY
+      # --------------------------------------------------
+      - name: Verify deployment files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh whatsappcrm-vps \
+            "BASE='$DEPLOY_BASE_PATH' PHP_BIN='$PHP_BIN' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          APP="$BASE/current"
+
+          test -f "$APP/artisan"
+          test -f "$APP/vendor/autoload.php"
+          test -f "$APP/public/index.php"
+          test -L "$APP/.env"
+          test -L "$APP/storage"
+
+          echo "WhatsApp CRM deployment checks passed."
+          REMOTE
+
+      # --------------------------------------------------
+      # 10. CLEANUP RUNNER SSH FILES
+      # --------------------------------------------------
+      - name: Cleanup SSH
+        if: always()
+        shell: bash
+        run: |
+          rm -f \
+            "$HOME/.ssh/whatsappcrm_key" \
+            "$HOME/.ssh/known_hosts" \
+            "$HOME/.ssh/config"
