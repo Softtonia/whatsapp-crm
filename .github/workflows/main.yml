@@ -1,0 +1,403 @@
+
+name: Deploy WhatsApp CRM Next.js
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: whatsappcrm-softtonia-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and deploy Next.js frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      DEPLOY_HOST: ${{ secrets.DEV_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEV_PORT }}
+      DEPLOY_USER: ${{ secrets.DEV_USER }}
+      DEPLOY_BASE_PATH: ${{ secrets.DEV_BASE_PATH }}
+      NEXT_PUBLIC_API_BASE_URL: ${{ secrets.NEXT_PUBLIC_API_BASE_URL }}
+      APP_PORT: "3105"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate configuration and Next.js source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for name in DEPLOY_HOST DEPLOY_PORT DEPLOY_USER \
+                      DEPLOY_BASE_PATH NEXT_PUBLIC_API_BASE_URL; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name secret is missing."
+              exit 1
+            fi
+          done
+
+          [ "$DEPLOY_PORT" = "22" ]
+          [ "$DEPLOY_BASE_PATH" = \
+            "/var/www/whatsappcrm.softtonia.com" ]
+          [ "$NEXT_PUBLIC_API_BASE_URL" = \
+            "https://whatsappcrmapi.softtonia.com/api" ]
+
+          test -f package.json
+          test -f package-lock.json
+
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const deps = { ...p.dependencies, ...p.devDependencies };
+
+          if (!deps.next || !p.scripts?.build || !p.scripts?.start) {
+            console.error(
+              'package.json must contain Next.js and build/start scripts.'
+            );
+            process.exit(1);
+          }
+
+          if (!p.dependencies?.next) {
+            console.error('next must be in production dependencies.');
+            process.exit(1);
+          }
+          NODE
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEV_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEV_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+
+          install -d -m 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" |
+            tr -d '\r' > "$HOME/.ssh/whatsappcrm_key"
+          chmod 600 "$HOME/.ssh/whatsappcrm_key"
+
+          ssh-keygen -y -f "$HOME/.ssh/whatsappcrm_key" >/dev/null
+
+          printf '%s\n' "$SSH_KNOWN_HOSTS" |
+            tr -d '\r' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          cat > "$HOME/.ssh/config" <<EOF
+          Host whatsappcrm-server
+              HostName ${DEPLOY_HOST}
+              Port ${DEPLOY_PORT}
+              User ${DEPLOY_USER}
+              IdentityFile ${HOME}/.ssh/whatsappcrm_key
+              IdentitiesOnly yes
+              BatchMode yes
+              PasswordAuthentication no
+              StrictHostKeyChecking yes
+              UserKnownHostsFile ${HOME}/.ssh/known_hosts
+              ConnectTimeout 15
+          EOF
+
+          chmod 600 "$HOME/.ssh/config"
+
+          ssh whatsappcrm-server \
+            'printf "SSH authentication successful\n"'
+
+      - name: Generate production environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          printf 'NEXT_PUBLIC_API_BASE_URL=%s\n' \
+            "$NEXT_PUBLIC_API_BASE_URL" > .env.production
+
+          echo "Next.js production environment generated."
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js
+        run: npm run build
+
+      - name: Validate Next.js build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d .next
+          test -s package.json
+          test -s package-lock.json
+
+          echo "Next.js build validated."
+
+      - name: Create and upload release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::12}"
+          RELEASE_PATH="$DEPLOY_BASE_PATH/releases/$RELEASE_ID"
+
+          ssh whatsappcrm-server \
+            "BASE='$DEPLOY_BASE_PATH' RELEASE_ID='$RELEASE_ID' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          [ "$BASE" = "/var/www/whatsappcrm.softtonia.com" ]
+          mkdir -p "$BASE/releases"
+          mkdir "$BASE/releases/$RELEASE_ID"
+          chown root:root "$BASE" "$BASE/releases"
+          chmod 755 "$BASE" "$BASE/releases"
+          REMOTE
+
+          # Upload only the build and runtime files.
+          # Do not upload .env.production or node_modules.
+          rsync -az --delete \
+            --exclude='.env*' \
+            --exclude='node_modules/' \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='coverage/' \
+            -e "ssh -F $HOME/.ssh/config" \
+            .next public package.json package-lock.json \
+            next.config.* \
+            "whatsappcrm-server:${RELEASE_PATH}/" 2>/dev/null || {
+              echo "::error::Release upload failed. Check Next.js files and SSH access."
+              exit 1
+            }
+
+          ssh whatsappcrm-server \
+            "APP='$RELEASE_PATH' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          test -s "$APP/package.json"
+          test -s "$APP/package-lock.json"
+          test -d "$APP/.next"
+
+          cd "$APP"
+          npm ci --omit=dev --no-audit --no-fund
+          test -x node_modules/.bin/next
+
+          chown -R root:root "$APP"
+          find "$APP" -type d -exec chmod 755 {} +
+          find "$APP" -type f -exec chmod 644 {} +
+
+          echo "Release dependencies installed."
+          REMOTE
+
+          echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
+
+      - name: Activate release and start Next.js
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh whatsappcrm-server \
+            "BASE='$DEPLOY_BASE_PATH' RELEASE_ID='$RELEASE_ID' APP_PORT='$APP_PORT' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          BASE="$BASE"
+          NEW="$BASE/releases/$RELEASE_ID"
+          CURRENT="$BASE/current"
+          PREVIOUS="$BASE/previous"
+
+          test -s "$NEW/package.json"
+          test -d "$NEW/.next"
+          test -x "$NEW/node_modules/.bin/next"
+
+          if [ -e "$CURRENT" ] && [ ! -L "$CURRENT" ]; then
+            echo "ERROR: current exists but is not a symlink."
+            exit 1
+          fi
+
+          OLD=""
+          if [ -L "$CURRENT" ]; then
+            OLD="$(readlink "$CURRENT")"
+            ln -sfn "$OLD" "$PREVIOUS"
+          fi
+
+          TMP="$BASE/.current-$RELEASE_ID"
+          ln -s "$NEW" "$TMP"
+          mv -Tf "$TMP" "$CURRENT"
+
+          if pm2 describe whatsappcrm-next >/dev/null 2>&1; then
+            pm2 delete whatsappcrm-next
+          fi
+
+          cd "$CURRENT"
+          pm2 start node_modules/next/dist/bin/next \
+            --name whatsappcrm-next \
+            --cwd "$BASE/current" \
+            -- start -p "$APP_PORT" -H 127.0.0.1
+
+          pm2 save
+
+          # Wait for the app to become healthy.
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$APP_PORT/" \
+              -o /dev/null; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$READY" != "1" ]; then
+            pm2 logs whatsappcrm-next --nostream --lines 50 || true
+
+            pm2 delete whatsappcrm-next || true
+
+            if [ -n "$OLD" ] && [ -d "$OLD" ]; then
+              ln -sfn "$OLD" "$BASE/.rollback-current"
+              mv -Tf "$BASE/.rollback-current" "$CURRENT"
+
+              cd "$CURRENT"
+              pm2 start node_modules/next/dist/bin/next \
+                --name whatsappcrm-next \
+                --cwd "$BASE/current" \
+                -- start -p "$APP_PORT" -H 127.0.0.1
+              pm2 save
+            fi
+
+            echo "ERROR: Next.js health check failed."
+            exit 1
+          fi
+
+          echo "Next.js is responding on port $APP_PORT."
+          REMOTE
+
+      - name: Configure Nginx reverse proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh whatsappcrm-server 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          DOMAIN="whatsappcrm.softtonia.com"
+          BASE="/var/www/whatsappcrm.softtonia.com"
+          AVAILABLE="/etc/nginx/sites-available/$DOMAIN"
+          ENABLED="/etc/nginx/sites-enabled/$DOMAIN"
+          PORT="3105"
+
+          test -L "$ENABLED"
+          test -s "$BASE/current/package.json"
+          test -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+          test -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+          curl -fsS "http://127.0.0.1:$PORT/" -o /dev/null
+
+          BACKUP="${AVAILABLE}.bak.$(date +%Y%m%d%H%M%S)"
+          cp -a "$AVAILABLE" "$BACKUP"
+
+          cat > "$AVAILABLE" <<'NGINX'
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name whatsappcrm.softtonia.com;
+
+              location ^~ /.well-known/acme-challenge/ {
+                  root /var/www/whatsappcrm.softtonia.com/shared;
+                  default_type text/plain;
+                  try_files $uri =404;
+              }
+
+              location / {
+                  return 301 https://$host$request_uri;
+              }
+
+              location ~ /\. {
+                  deny all;
+              }
+          }
+
+          server {
+              listen 443 ssl;
+              listen [::]:443 ssl;
+              server_name whatsappcrm.softtonia.com;
+
+              ssl_certificate /etc/letsencrypt/live/whatsappcrm.softtonia.com/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/whatsappcrm.softtonia.com/privkey.pem;
+
+              access_log /var/log/nginx/whatsappcrm.softtonia.com.access.log;
+              error_log /var/log/nginx/whatsappcrm.softtonia.com.error.log;
+
+              location ^~ /.well-known/acme-challenge/ {
+                  root /var/www/whatsappcrm.softtonia.com/shared;
+                  default_type text/plain;
+                  try_files $uri =404;
+              }
+
+              location / {
+                  proxy_pass http://127.0.0.1:3105;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 60s;
+              }
+
+              location ~ /\.(?!well-known).* {
+                  deny all;
+              }
+          }
+          NGINX
+
+          if ! nginx -t; then
+            cp -a "$BACKUP" "$AVAILABLE"
+            nginx -t
+            echo "Nginx validation failed; previous config restored."
+            exit 1
+          fi
+
+          if ! systemctl reload nginx; then
+            cp -a "$BACKUP" "$AVAILABLE"
+            nginx -t
+            systemctl reload nginx
+            echo "Nginx reload failed; previous config restored."
+            exit 1
+          fi
+
+          echo "Nginx reverse proxy enabled."
+          echo "Backup: $BACKUP"
+          REMOTE
+
+      - name: Verify HTTPS deployment
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            --retry 5 --retry-delay 2 \
+            https://whatsappcrm.softtonia.com/ \
+            -o /tmp/whatsappcrm.html
+
+          test -s /tmp/whatsappcrm.html
+          echo "Next.js frontend is responding over HTTPS."
+
+      - name: Cleanup SSH files
+        if: always()
+        run: |
+          rm -f \
+            "$HOME/.ssh/whatsappcrm_key" \
+            "$HOME/.ssh/known_hosts" \
+            "$HOME/.ssh/config"
